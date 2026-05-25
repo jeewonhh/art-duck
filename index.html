@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>duck-art · Quack smoke test</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+    h1 { margin-bottom: 0.25rem; }
+    .sub { color: #666; margin-bottom: 1.5rem; }
+    .row { margin: 0.75rem 0; }
+    button { padding: 0.5rem 0.9rem; margin-right: 0.5rem; font-size: 0.95rem; cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: 0.5; }
+    pre { background: #f5f5f5; padding: 0.75rem; overflow-x: auto; font-size: 0.85rem; }
+    #status { padding: 0.5rem 0.75rem; border-radius: 4px; background: #eef; }
+    #status.error { background: #fee; color: #900; }
+    #status.ok { background: #efe; color: #060; }
+    code { background: #f0f0f0; padding: 0 0.25rem; }
+  </style>
+</head>
+<body>
+  <h1>duck-art</h1>
+  <div class="sub">DuckDB-Wasm → Quack → local <code>pixels.db</code></div>
+
+  <div id="status">Booting DuckDB-Wasm…</div>
+
+  <div class="row">
+    <button id="btn-read" disabled>Read 5 most-recent pixels</button>
+    <button id="btn-insert" disabled>Insert/replace random pixel</button>
+    <button id="btn-count" disabled>Count pixels</button>
+  </div>
+
+  <pre id="output">(no output yet)</pre>
+
+  <script type="module">
+    import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.33.1-dev55.0/+esm';
+
+    const $status = document.getElementById('status');
+    const $output = document.getElementById('output');
+    const $read = document.getElementById('btn-read');
+    const $insert = document.getElementById('btn-insert');
+    const $count = document.getElementById('btn-count');
+
+    const setStatus = (msg, kind = '') => {
+      $status.textContent = msg;
+      $status.className = kind;
+    };
+    const jsonReplacer = (_k, v) => (typeof v === 'bigint' ? v.toString() : v);
+    const showRows = (table) => {
+      const rows = table.toArray().map((r) => r.toJSON());
+      $output.textContent = JSON.stringify(rows, jsonReplacer, 2);
+    };
+
+    const USER_ID = (() => {
+      let id = localStorage.getItem('duck-art-user');
+      if (!id) {
+        id = crypto.randomUUID();
+        localStorage.setItem('duck-art-user', id);
+      }
+      return id;
+    })();
+
+    // Must match the server's actual auth_token (row returned by CALL quack_serve(...)).
+    const SERVER_TOKEN = 'abcd';
+    const REMOTE_URI = 'quack:localhost';
+
+    let conn;
+
+    // Helper: run any SQL on the remote server via quack_query. ATTACH path is broken in v1.5.3,
+    // so we wrap every query in quack_query(uri, sql, token=...). Inner single quotes are doubled.
+    const remoteQuery = (sql) => {
+      const escaped = sql.replace(/'/g, "''");
+      return conn.query(`FROM quack_query('${REMOTE_URI}', '${escaped}', token='${SERVER_TOKEN}')`);
+    };
+
+    try {
+      setStatus('Selecting Wasm bundle…');
+      const bundles = duckdb.getJsDelivrBundles();
+      const bundle = await duckdb.selectBundle(bundles);
+
+      setStatus('Spawning worker…');
+      const workerUrl = URL.createObjectURL(
+        new Blob([`importScripts("${bundle.mainWorker}");`], { type: 'text/javascript' })
+      );
+      const worker = new Worker(workerUrl);
+      const db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), worker);
+      await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+      URL.revokeObjectURL(workerUrl);
+
+      setStatus('Loading quack + smoke test…');
+      conn = await db.connect();
+      await conn.query('LOAD quack');
+      // ATTACH is broken in quack v1.5.3 (both wasm and native) — use quack_query for everything.
+      const smoke = await conn.query(
+        `FROM quack_query('${REMOTE_URI}', 'SELECT count(*) AS n FROM pixels', token='${SERVER_TOKEN}')`
+      );
+      $output.textContent = JSON.stringify(smoke.toArray().map((r) => r.toJSON()), jsonReplacer, 2);
+
+
+      setStatus(`connected · user_id=${USER_ID}`, 'ok');
+      $read.disabled = false;
+      $insert.disabled = false;
+      $count.disabled = false;
+    } catch (err) {
+      console.error(err);
+      setStatus(`boot failed: ${err.message}`, 'error');
+    }
+
+    $read.addEventListener('click', async () => {
+      try {
+        setStatus('Reading…');
+        const result = await remoteQuery(
+          'SELECT x, y, color, user_id, updated_at FROM pixels ORDER BY updated_at DESC LIMIT 5'
+        );
+        showRows(result);
+        setStatus('read ok', 'ok');
+      } catch (err) {
+        console.error(err);
+        setStatus(`read failed: ${err.message}`, 'error');
+      }
+    });
+
+    $insert.addEventListener('click', async () => {
+      const x = Math.floor(Math.random() * 200);
+      const y = Math.floor(Math.random() * 200);
+      const color = Math.floor(Math.random() * 16);
+      try {
+        setStatus(`Writing (${x},${y})=${color}…`);
+        await remoteQuery(
+          `INSERT OR REPLACE INTO pixels (x, y, color, user_id, updated_at) VALUES (${x}, ${y}, ${color}, '${USER_ID}', now())`
+        );
+        setStatus(`wrote (${x},${y})=${color} — click Read to verify`, 'ok');
+      } catch (err) {
+        console.error(err);
+        setStatus(`insert failed: ${err.message}`, 'error');
+      }
+    });
+
+    $count.addEventListener('click', async () => {
+      try {
+        setStatus('Counting…');
+        const result = await remoteQuery('SELECT count(*) AS n FROM pixels');
+        showRows(result);
+        setStatus('count ok', 'ok');
+      } catch (err) {
+        console.error(err);
+        setStatus(`count failed: ${err.message}`, 'error');
+      }
+    });
+  </script>
+</body>
+</html>
