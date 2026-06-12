@@ -2,80 +2,210 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>duck-art · Quack smoke test</title>
+  <title>duck-art · r/place</title>
   <style>
-    body { font-family: -apple-system, system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 1.5rem auto; max-width: 720px; padding: 0 1rem; color: #222; }
     h1 { margin-bottom: 0.25rem; }
-    .sub { color: #666; margin-bottom: 1.5rem; }
-    .row { margin: 0.75rem 0; }
-    button { padding: 0.5rem 0.9rem; margin-right: 0.5rem; font-size: 0.95rem; cursor: pointer; }
-    button:disabled { cursor: not-allowed; opacity: 0.5; }
-    pre { background: #f5f5f5; padding: 0.75rem; overflow-x: auto; font-size: 0.85rem; }
-    #status { padding: 0.5rem 0.75rem; border-radius: 4px; background: #eef; }
+    .sub { color: #666; margin-bottom: 1rem; font-size: 0.9rem; }
+    #status { padding: 0.4rem 0.7rem; border-radius: 4px; background: #eef; font-size: 0.85rem; margin-bottom: 0.75rem; }
     #status.error { background: #fee; color: #900; }
     #status.ok { background: #efe; color: #060; }
+    #palette { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 0.75rem; }
+    .swatch { width: 28px; height: 28px; border: 2px solid #ccc; border-radius: 4px; cursor: pointer; padding: 0; }
+    .swatch.sel { border-color: #000; box-shadow: 0 0 0 2px #fff, 0 0 0 4px #000; }
+    #wrap { border: 1px solid #ccc; width: 600px; height: 600px; background: #fff; overflow: hidden; position: relative; }
+    /* Internal canvas is 300x300; transform scales it up with crisp pixels. */
+    #board { image-rendering: pixelated; cursor: crosshair; position: absolute; top: 0; left: 0; transform-origin: 0 0; }
+    .hint { color: #888; font-size: 0.8rem; margin-top: 0.4rem; }
     code { background: #f0f0f0; padding: 0 0.25rem; }
   </style>
 </head>
 <body>
   <h1>duck-art</h1>
-  <div class="sub">DuckDB-Wasm → Quack → local <code>pixels.db</code></div>
+  <div class="sub">200×200 · 16 colors · DuckDB-Wasm → Quack → <code>pixels.db</code></div>
 
   <div id="status">Booting DuckDB-Wasm…</div>
+  <div id="palette"></div>
 
-  <div class="row">
-    <button id="btn-read" disabled>Read 5 most-recent pixels</button>
-    <button id="btn-insert" disabled>Insert/replace random pixel</button>
-    <button id="btn-count" disabled>Count pixels</button>
+  <div id="wrap">
+    <canvas id="board"></canvas>
   </div>
-
-  <pre id="output">(no output yet)</pre>
+  <div class="hint">scroll to zoom · drag to pan · click to paint</div>
 
   <script type="module">
     import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.33.1-dev55.0/+esm';
 
-    const $status = document.getElementById('status');
-    const $output = document.getElementById('output');
-    const $read = document.getElementById('btn-read');
-    const $insert = document.getElementById('btn-insert');
-    const $count = document.getElementById('btn-count');
+    const SIZE = 200;            // board is SIZE x SIZE
+    const POLL_MS = 1000;        // changed-only poll interval
+    const SERVER_TOKEN = 'abcd'; // must match quack_serve(token=...)
+    const REMOTE_URI = 'quack:localhost';
 
-    const setStatus = (msg, kind = '') => {
-      $status.textContent = msg;
-      $status.className = kind;
-    };
-    const jsonReplacer = (_k, v) => (typeof v === 'bigint' ? v.toString() : v);
-    const showRows = (table) => {
-      const rows = table.toArray().map((r) => r.toJSON());
-      $output.textContent = JSON.stringify(rows, jsonReplacer, 2);
-    };
+    // 2017 r/place 16-color palette, index 0..15 → [r,g,b].
+    const PALETTE = [
+      [0xFF,0xFF,0xFF],[0xE4,0xE4,0xE4],[0x88,0x88,0x88],[0x22,0x22,0x22],
+      [0xFF,0xA7,0xD1],[0xE5,0x00,0x00],[0xE5,0x95,0x00],[0xA0,0x6A,0x42],
+      [0xE5,0xD9,0x00],[0x94,0xE0,0x44],[0x02,0xBE,0x01],[0x00,0xD3,0xDD],
+      [0x00,0x83,0xC7],[0x00,0x00,0xEA],[0xCF,0x6E,0xE4],[0x82,0x00,0x80],
+    ];
 
+    const $status  = document.getElementById('status');
+    const $palette = document.getElementById('palette');
+    const $board   = document.getElementById('board');
+    $board.width = $board.height = SIZE;   // internal resolution derived from SIZE
+    const ctx = $board.getContext('2d');
+    const img = ctx.createImageData(SIZE, SIZE);
+
+    const setStatus = (msg, kind = '') => { $status.textContent = msg; $status.className = kind; };
+
+    // ?user=alice forces a distinct id (multi-user testing from one browser); else persisted UUID.
     const USER_ID = (() => {
+      const override = new URLSearchParams(location.search).get('user');
+      if (override) return override;
       let id = localStorage.getItem('duck-art-user');
-      if (!id) {
-        id = crypto.randomUUID();
-        localStorage.setItem('duck-art-user', id);
-      }
+      if (!id) { id = crypto.randomUUID(); localStorage.setItem('duck-art-user', id); }
       return id;
     })();
 
-    // Must match the server's actual auth_token (row returned by CALL quack_serve(...)).
-    const SERVER_TOKEN = 'abcd';
-    const REMOTE_URI = 'quack:localhost';
-
+    let selectedColor = 5; // start red
     let conn;
+    let watermark = null;  // max updated_at seen, as a string literal for SQL
 
-    // Helper: run any SQL on the remote server via quack_query. ATTACH path is broken in v1.5.3,
-    // so we wrap every query in quack_query(uri, sql, token=...). Inner single quotes are doubled.
+    // Paint one pixel into the ImageData backing buffer (no canvas flush).
+    const setPixel = (x, y, color) => {
+      const [r, g, b] = PALETTE[color] ?? PALETTE[0];
+      const i = (y * SIZE + x) * 4;
+      img.data[i] = r; img.data[i + 1] = g; img.data[i + 2] = b; img.data[i + 3] = 255;
+    };
+    const flush = () => ctx.putImageData(img, 0, 0);
+
+    // Run SQL on the remote quack server. ATTACH is broken in v1.5.3 — wrap in quack_query.
     const remoteQuery = (sql) => {
       const escaped = sql.replace(/'/g, "''");
       return conn.query(`FROM quack_query('${REMOTE_URI}', '${escaped}', token='${SERVER_TOKEN}')`);
     };
+    const rowsOf = (table) => table.toArray().map((r) => r.toJSON());
+
+    // Build palette UI.
+    PALETTE.forEach(([r, g, b], idx) => {
+      const btn = document.createElement('button');
+      btn.className = 'swatch' + (idx === selectedColor ? ' sel' : '');
+      btn.style.background = `rgb(${r},${g},${b})`;
+      btn.title = `color ${idx}`;
+      btn.addEventListener('click', () => {
+        selectedColor = idx;
+        document.querySelectorAll('.swatch').forEach((s, i) => s.classList.toggle('sel', i === idx));
+      });
+      $palette.appendChild(btn);
+    });
+
+    // View transform: canvas (300x300) scaled by `scale`, translated by (offX, offY) inside #wrap.
+    const $wrap = document.getElementById('wrap');
+    const WRAP = 600;                  // #wrap is WRAP x WRAP px
+    const MIN_SCALE = WRAP / SIZE;     // board can never be smaller than the viewport
+    const MAX_SCALE = 40;
+    let scale = MIN_SCALE, offX = 0, offY = 0;
+    // Keep the board covering the viewport: no gaps, no drifting into empty corners.
+    const clampView = () => {
+      scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale));
+      const boardPx = SIZE * scale;
+      offX = Math.min(0, Math.max(WRAP - boardPx, offX));
+      offY = Math.min(0, Math.max(WRAP - boardPx, offY));
+    };
+    const applyTransform = () => {
+      clampView();
+      $board.style.transform = `translate(${offX}px, ${offY}px) scale(${scale})`;
+    };
+    applyTransform();
+
+    // Map a pointer event to board cell, accounting for pan/zoom. cellPx on screen == scale.
+    const eventToCell = (ev) => {
+      const rect = $wrap.getBoundingClientRect();
+      const x = Math.floor((ev.clientX - rect.left - offX) / scale);
+      const y = Math.floor((ev.clientY - rect.top  - offY) / scale);
+      return { x: Math.max(0, Math.min(SIZE - 1, x)), y: Math.max(0, Math.min(SIZE - 1, y)) };
+    };
+
+    const paint = async (x, y) => {
+      const color = selectedColor;
+      setPixel(x, y, color); flush();                 // optimistic local paint
+      try {
+        await remoteQuery(
+          `INSERT OR REPLACE INTO pixels (x, y, color, user_id, updated_at) ` +
+          `VALUES (${x}, ${y}, ${color}, '${USER_ID}', now())`
+        );
+        setStatus(`painted (${x},${y})=${color}`, 'ok');
+      } catch (err) {
+        console.error(err);
+        setStatus(`paint failed: ${err.message}`, 'error');
+      }
+    };
+
+    // Wheel zoom toward cursor.
+    $wrap.addEventListener('wheel', (ev) => {
+      ev.preventDefault();
+      const rect = $wrap.getBoundingClientRect();
+      const px = ev.clientX - rect.left, py = ev.clientY - rect.top;
+      const factor = ev.deltaY < 0 ? 1.15 : 1 / 1.15;
+      const next = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale * factor));
+      // Keep the board point under the cursor fixed.
+      offX = px - (px - offX) * (next / scale);
+      offY = py - (py - offY) * (next / scale);
+      scale = next;
+      applyTransform();
+    }, { passive: false });
+
+    // Drag to pan; a near-zero drag is treated as a paint click.
+    let down = null, moved = false;
+    $wrap.addEventListener('mousedown', (ev) => {
+      down = { x: ev.clientX, y: ev.clientY, offX, offY };
+      moved = false;
+    });
+    window.addEventListener('mousemove', (ev) => {
+      if (!down) return;
+      const dx = ev.clientX - down.x, dy = ev.clientY - down.y;
+      if (Math.abs(dx) + Math.abs(dy) > 4) moved = true;
+      offX = down.offX + dx; offY = down.offY + dy;
+      applyTransform();
+    });
+    window.addEventListener('mouseup', (ev) => {
+      if (!down) return;
+      if (!moved) { const { x, y } = eventToCell(ev); paint(x, y); }
+      down = null;
+    });
+
+    // Track the high-water timestamp from a set of rows.
+    const bumpWatermark = (rows) => {
+      for (const r of rows) {
+        const t = String(r.updated_at);
+        if (watermark === null || t > watermark) watermark = t;
+      }
+    };
+
+    // Return updated_at as a fixed-width string so JS string-compare == timestamp order.
+    const TS = `strftime(updated_at, '%Y-%m-%d %H:%M:%S.%f') AS updated_at`;
+
+    // Poll for only the pixels changed since the watermark.
+    const pollChanges = async () => {
+      try {
+        const result = await remoteQuery(
+          `SELECT x, y, color, ${TS} FROM pixels ` +
+          `WHERE updated_at > TIMESTAMP '${watermark}' ORDER BY updated_at`
+        );
+        const rows = rowsOf(result);
+        if (rows.length) {
+          for (const r of rows) setPixel(Number(r.x), Number(r.y), Number(r.color));
+          flush();
+          bumpWatermark(rows);
+        }
+      } catch (err) {
+        console.error(err);
+        setStatus(`poll failed: ${err.message}`, 'error');
+      }
+    };
 
     try {
       setStatus('Selecting Wasm bundle…');
-      const bundles = duckdb.getJsDelivrBundles();
-      const bundle = await duckdb.selectBundle(bundles);
+      const bundle = await duckdb.selectBundle(duckdb.getJsDelivrBundles());
 
       setStatus('Spawning worker…');
       const workerUrl = URL.createObjectURL(
@@ -86,66 +216,23 @@
       await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
       URL.revokeObjectURL(workerUrl);
 
-      setStatus('Loading quack + smoke test…');
+      setStatus('Loading quack + initial board…');
       conn = await db.connect();
       await conn.query('LOAD quack');
-      // ATTACH is broken in quack v1.5.3 (both wasm and native) — use quack_query for everything.
-      const smoke = await conn.query(
-        `FROM quack_query('${REMOTE_URI}', 'SELECT count(*) AS n FROM pixels', token='${SERVER_TOKEN}')`
-      );
-      $output.textContent = JSON.stringify(smoke.toArray().map((r) => r.toJSON()), jsonReplacer, 2);
 
+      // Initial full load: paint every pixel once.
+      const all = rowsOf(await remoteQuery(`SELECT x, y, color, ${TS} FROM pixels`));
+      for (const r of all) setPixel(Number(r.x), Number(r.y), Number(r.color));
+      flush();
+      bumpWatermark(all);
+      if (watermark === null) watermark = '1970-01-01 00:00:00'; // empty board fallback
 
-      setStatus(`connected · user_id=${USER_ID}`, 'ok');
-      $read.disabled = false;
-      $insert.disabled = false;
-      $count.disabled = false;
+      setStatus(`connected · user_id=${USER_ID} · pick a color, click to paint`, 'ok');
+      setInterval(pollChanges, POLL_MS);
     } catch (err) {
       console.error(err);
       setStatus(`boot failed: ${err.message}`, 'error');
     }
-
-    $read.addEventListener('click', async () => {
-      try {
-        setStatus('Reading…');
-        const result = await remoteQuery(
-          'SELECT x, y, color, user_id, updated_at FROM pixels ORDER BY updated_at DESC LIMIT 5'
-        );
-        showRows(result);
-        setStatus('read ok', 'ok');
-      } catch (err) {
-        console.error(err);
-        setStatus(`read failed: ${err.message}`, 'error');
-      }
-    });
-
-    $insert.addEventListener('click', async () => {
-      const x = Math.floor(Math.random() * 200);
-      const y = Math.floor(Math.random() * 200);
-      const color = Math.floor(Math.random() * 16);
-      try {
-        setStatus(`Writing (${x},${y})=${color}…`);
-        await remoteQuery(
-          `INSERT OR REPLACE INTO pixels (x, y, color, user_id, updated_at) VALUES (${x}, ${y}, ${color}, '${USER_ID}', now())`
-        );
-        setStatus(`wrote (${x},${y})=${color} — click Read to verify`, 'ok');
-      } catch (err) {
-        console.error(err);
-        setStatus(`insert failed: ${err.message}`, 'error');
-      }
-    });
-
-    $count.addEventListener('click', async () => {
-      try {
-        setStatus('Counting…');
-        const result = await remoteQuery('SELECT count(*) AS n FROM pixels');
-        showRows(result);
-        setStatus('count ok', 'ok');
-      } catch (err) {
-        console.error(err);
-        setStatus(`count failed: ${err.message}`, 'error');
-      }
-    });
   </script>
 </body>
 </html>
