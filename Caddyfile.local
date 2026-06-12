@@ -1,0 +1,44 @@
+# Local wss/TLS proof for quack. Caddy terminates TLS with its internal CA and
+# reverse-proxies to the plain-HTTP quack server on :9494.
+{
+    auto_https disable_redirects
+    servers {
+        protocols h1
+    }
+}
+
+# quack RPC behind TLS — client connects to quack:localhost:9443 (=> https://localhost:9443).
+# quack already sets Access-Control-Allow-Origin:* on its /quack responses, so the real
+# request just needs proxying. But quack does NOT answer the browser's CORS preflight, so
+# Caddy answers OPTIONS here — and must list Authorization explicitly (quack sends the token
+# in that header, and the "*" wildcard does not cover Authorization per the CORS spec).
+localhost:9443 {
+    tls internal
+    log {
+        output file /tmp/caddy-quack-access.log
+    }
+
+    # Answer CORS preflight directly, before proxying.
+    @preflight method OPTIONS
+    handle @preflight {
+        header Access-Control-Allow-Origin "*"
+        header Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        # Authorization must be listed explicitly — the "*" wildcard does NOT cover it.
+        header Access-Control-Allow-Headers "Authorization, Content-Type"
+        header Access-Control-Max-Age "86400"
+        respond 204
+    }
+
+    # Real requests: just proxy. quack's own single ACAO:* header passes through.
+    handle {
+        reverse_proxy localhost:9494
+    }
+}
+
+# static page over https on the same internal CA (no mixed content with the above).
+# `root * .` is relative to the directory you launch `caddy run` from (the repo root).
+localhost:8443 {
+    tls internal
+    root * .
+    file_server
+}

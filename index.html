@@ -38,7 +38,7 @@
     const SIZE = 200;            // board is SIZE x SIZE
     const POLL_MS = 1000;        // changed-only poll interval
     const SERVER_TOKEN = 'abcd'; // must match quack_serve(token=...)
-    const REMOTE_URI = 'quack:localhost';
+    const REMOTE_URI = 'quack:localhost:9443';
 
     // 2017 r/place 16-color palette, index 0..15 → [r,g,b].
     const PALETTE = [
@@ -81,7 +81,8 @@
     // Run SQL on the remote quack server. ATTACH is broken in v1.5.3 — wrap in quack_query.
     const remoteQuery = (sql) => {
       const escaped = sql.replace(/'/g, "''");
-      return conn.query(`FROM quack_query('${REMOTE_URI}', '${escaped}', token='${SERVER_TOKEN}')`);
+      // disable_ssl=false forces https → reaches Caddy's TLS port (quack defaults to plain http).
+      return conn.query(`FROM quack_query('${REMOTE_URI}', '${escaped}', disable_ssl=false, token='${SERVER_TOKEN}')`);
     };
     const rowsOf = (table) => table.toArray().map((r) => r.toJSON());
 
